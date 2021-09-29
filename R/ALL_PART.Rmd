@@ -1,0 +1,1596 @@
+---
+title: "ALL_PART"
+author: "Kuo-Lin Tang"
+date: "30/06/2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part A: Construction of Corpus – Fetching 10-Q and 10-K forms from EDGAR
+## Required packages
+```{r message = FALSE, warning = FALSE}
+library(tidytext)
+library(tidyverse)
+library(stringr)
+library(readxl)
+library(lubridate)
+library(edgar)
+library(BatchGetSymbols)
+library(pdftools)
+library(SentimentAnalysis)
+library(stm)
+# row to column names
+library(janitor)
+```
+
+
+
+## Data Collection
+### Build a company data frame from the assignment description
+```{r}
+# create the data frame
+project_description = pdf_text("../../individual_assignment_description_ib9cw0_2021.pdf")
+company_list = unlist(str_split(project_description, "[\\r\\n]+"))
+company_list = str_split_fixed(str_trim(company_list), "\\s{2,}", 5) %>%
+  as.data.frame()
+company_list[company_list == ""] = NA
+company_list = na.omit(company_list)
+
+# first row to column names
+library(janitor)
+company_list = company_list %>%
+  row_to_names(row_number(1))
+
+# reset row index
+row.names(company_list) = NULL
+
+# clear the memory
+rm(project_description)
+
+# check the data frame
+str(company_list)
+
+# change CIK into numerical form
+company_list$CIK = as.numeric(company_list$CIK)
+
+# check the data frame
+str(company_list)
+```
+
+### Download all required datasets
+#### Get a full list of CIK
+```{r}
+CIK_list = company_list$CIK
+
+write.csv(company_list, "company_list.csv")
+```
+
+#### Get management discussions
+Downloading 
+
+I used Python to download the required datasets because the R API was not working.
+```{python eval = FALSE}
+from sec_edgar_downloader import Downloader
+import pandas as pd
+
+company_list = pd.read_csv("company_list.csv")
+company_cik_list = [str(i).zfill(10) for i in list(company_list["CIK"])]
+
+dl = Downloader()
+for company in company_cik_list:
+    dl.get("10-K", company, after="2010-01-01", before="2020-12-31")
+```
+
+
+#### Extract Management Discussions from the filings
+```{r eval = FALSE}
+all_md_texts = data.frame()
+i = 1
+# all_files = data.frame()
+all_ciks = list.files(path = "sec-edgar-filings/")
+for (cik in all_ciks){
+  print(i)
+  cik_dir_path = paste0("sec-edgar-filings/", cik)
+  all_filings_directories = list.files(path = paste0(cik_dir_path, "/10-K"))
+  for (filing in all_filings_directories){
+    filing_path = paste0(cik_dir_path, "/10-K/", filing, "/full-submission.txt")
+    filing.text = readLines(filing_path)
+    
+    # Get filing dates
+    filing.text.combined = paste(filing.text, collapse = "")
+    date.end = as.numeric(str_locate(filing.text.combined, "DATE AS OF CHANGE:"))[1]-1
+    date.filed = ymd(str_sub(filing.text.combined, date.end-7, date.end))
+    
+    # Extract data from first <DOCUMENT> to </DOCUMENT>
+    tryCatch({
+      filing.text = filing.text[(grep("<DOCUMENT>", filing.text, ignore.case = TRUE)[1]):(grep("</DOCUMENT>", filing.text, ignore.case = TRUE)[1])]}, error = function(e) {
+      filing.text = filing.text
+      ## In case opening and closing DOCUMENT TAG not found, cosnider full web page
+    })
+    
+    # See if 10-K is in XLBR or old text format
+    if (any(grepl(pattern = "<xml>|<type>xml|<html>|10k.htm", filing.text, ignore.case = T))) {
+      doc = XML::htmlParse(filing.text, asText = TRUE, useInternalNodes = TRUE, addFinalizer = FALSE)
+      f.text = XML::xpathSApply(doc, "//text()[not(ancestor::script)][not(ancestor::style)][not(ancestor::noscript)][not(ancestor::form)]", XML::xmlValue)
+      f.text = iconv(f.text, "latin1", "ASCII", sub = " ")
+      ## Free up htmlParse document to avoid memory leakage, this calls C function
+      #.Call('RS_XML_forceFreeDoc', doc, package= 'XML')
+    } else {
+      f.text = filing.text
+    }
+    
+    # Preprocessing the filing text
+    f.text = gsub("\\n|\\t|$", " ", f.text)
+    f.text = gsub("^\\s{1,}", "", f.text)
+    f.text = gsub(" s ", " ", f.text)
+    # Check for empty Lines and delete it
+    empty.lnumbers = grep("^\\s*$", f.text)
+    if (length(empty.lnumbers) > 0) {
+      f.text <- f.text[-empty.lnumbers]  ## Remove all lines only with space
+    }
+    
+    # Get MD&A sections
+    startline <- grep("^Item\\s{0,}7[^A]", f.text, ignore.case = TRUE)
+    endline <- grep("^Item\\s{0,}7A", f.text, ignore.case = TRUE)
+    # if dont have Item 7A, then take upto Item 8
+    if (length(endline) == 0) {
+        endline <- grep("^Item\\s{0,}8", f.text, ignore.case = TRUE)
+    }
+    md.dicusssion <- NA
+    if (length(startline) != 0 && length(endline) != 0) {
+
+        startline <- startline[length(startline)]
+        endline <- endline[length(endline)] - 1
+
+        md.dicusssion <- paste(f.text[startline:endline], collapse = " ")
+        md.dicusssion <- gsub("\\s{2,}", " ", md.dicusssion)
+        words.count <- stringr::str_count(md.dicusssion, pattern = "\\S+")
+    }
+    temp = data.frame(CIK = cik, date.filed = date.filed, md_text = md.dicusssion)
+    all_md_texts = all_md_texts %>%
+      rbind(temp) %>%
+      na.omit()
+  }
+  i = i + 1
+}
+rm(temp, all_ciks, all_filings_directories, cik, cik_dir_path, date.end, date.filed, doc, empty.lnumbers, endline, f.text, filing, filing_path, filing.text, filing.text.combined, md.dicusssion, startline, words.count, i)
+
+all_md_texts$CIK = as.numeric(all_md_texts$CIK)
+
+saveRDS(all_md_texts, "all_md_texts.rds")
+```
+
+
+#### Combine the two datasets
+```{r}
+all_md_texts = readRDS("all_md_texts.rds")
+
+data = company_list %>%
+  select(CIK, Symbol, Security, `GICS Sub Industry`) %>%
+  left_join(all_md_texts, by = c("CIK")) %>%
+  rename(company.name = Security)
+
+# remove observations without management discussions
+data = data %>%
+  na.omit()
+row.names(data) = NULL
+
+# clear the memory
+rm(all_md_texts, company_list, CIK_list)
+
+data$date_before_filing = data$date.filed - 7
+data$date_after_filing = data$date.filed +3
+```
+
+
+#### get financial data
+downloading
+```{r message = FALSE, warning = FALSE, eval = FALSE}
+returns_weekly = data.frame()
+error_companies = data.frame()
+for (i in 1:nrow(data)){
+  temp = tryCatch({BatchGetSymbols::BatchGetSymbols(data$Symbol[i],
+                                   freq.data = "weekly",
+                                   first.date = data$date_before_filing[i],
+                                   last.date = data$date_after_filing[i],
+                                   type.return = "log")},
+           error = function(e){
+             data.frame(Symbol = data$Symbol[i], 
+                                date_before_filing = data$date_before_filing[i],
+                                date_after_filing = data$date_after_filing[i])
+           })
+  if (class(temp) == "list"){
+    temp = temp$df.tickers
+    returns_weekly = returns_weekly %>%
+      rbind(temp)
+  }
+  else{
+    error_companies = error_companies %>%
+      rbind(temp)
+  }
+}
+rm(i, temp)
+
+saveRDS(returns_weekly, "returns_weekly.rds")
+saveRDS(error_companies, "error_companies.rds")
+```
+
+
+remove indexes that do not have financial data
+```{r}
+returns_weekly = readRDS("returns_weekly.rds")
+error_companies = readRDS("error_companies.rds")
+
+data.backup = data
+
+data = data %>%
+  anti_join(error_companies, by = c("Symbol", "date_before_filing", "date_after_filing"))
+rm(error_companies)
+```
+
+calculate price changes and bind with the indexes
+```{r}
+returns_adjusted = returns_weekly %>% 
+  mutate(year = year(ref.date)) %>%
+  group_by(ticker, year) %>%
+  slice(c(1,n())) %>%
+  select(-ret.adjusted.prices, -ret.closing.prices) %>%
+  mutate(previous.prices = lag(price.adjusted)) %>%
+  mutate(log.adjusted.prices = log(price.adjusted) - log(previous.prices)) %>%
+  na.omit() %>%
+  left_join(returns_weekly, .)
+  
+temp = na.omit(returns_adjusted)
+data$price_before = as.numeric(temp$previous.prices)
+data$price_after = as.numeric(temp$price.adjusted)
+data$price_change = as.numeric(temp$log.adjusted.prices)
+
+rm(returns_adjusted, returns_weekly, temp)
+```
+
+Add a year column
+```{r}
+data$year = year(data$date.filed)
+```
+
+
+## Text Preprocessing
+document ID
+```{r}
+data = data %>%
+  mutate(doc_id = row_number())
+```
+
+get company name list
+```{r}
+name_list = str_trim(gsub("\\bplc|INC|CORP|DE|LTD|CO|CA\\b", "", unique(data$company.name),
+                          ignore.case = TRUE))
+
+part_of_name_list = c("plc","INC","CORP","DE","LTD","CO","CA")
+```
+
+
+### Language detection
+Check if all management discussions are in English
+```{r}
+library(cld2)
+
+data = data %>%
+  mutate(language = detect_language(md_text))
+
+which(data$language != "en")
+
+data$language = NULL
+```
+
+All management discussions are in English.
+
+
+### Text Length
+Check if all texts are long enough for analyses
+```{r}
+data$text_length = str_count(data$md_text, "\\b[A-Za-z]+\\b")
+
+min(data$text_length)
+max(data$text_length)
+mean(data$text_length)
+
+ggplot(data = data, aes(x = text_length)) + geom_histogram(binwidth = 500)
+
+# Remove documents which is shorter than 250 words
+data = data %>% 
+  filter(text_length > 2500)
+
+data$text_length = NULL
+```
+644 -> 597 documents
+
+47 documents which have fewer than 2500 words are seen to be abnormal and incomplete, so they are removed.
+
+### Contraction Handling
+```{r}
+library(textclean)
+
+data$no_contraction_text = replace_contraction(data$md_text, lexicon::key_contractions)
+```
+
+### trim spaces
+```{r}
+data$trimmed_text = str_trim(data$no_contraction_text)
+```
+
+
+## Extract features
+### Readability
+```{r eval=FALSE}
+readability_df = quanteda.textstats::textstat_readability(data$md_text, measure = c("ARI", "Flesch.Kincaid", "Linsear.Write"), remove_hyphens = F)
+
+readability_df$document = NULL
+
+saveRDS(readability_df, "readability_df.rds")
+```
+
+
+```{r}
+readability_df = readRDS("readability_df.rds")
+
+data = data %>%
+  cbind(readability_df)
+
+rm(readability_df)
+```
+
+### Formality
+```{r eval = FALSE}
+formality_df = qdap::formality(data$md_text, data$doc_id)
+
+saveRDS(formality_df, "formality_df.rds")
+```
+
+```{r}
+formality_df = readRDS("formality_df.rds")
+formality_df = formality_df$formality %>%
+  mutate(doc_id = as.numeric(doc_id)) %>%
+  select(-word.count)
+
+data = data %>%
+  left_join(formality_df, by = "doc_id")
+
+rm(formality_df)
+```
+
+### Number of words
+```{r}
+data$total_num_of_words = str_count(data$trimmed_text, "\\b[A-Za-z]+\\b")
+```
+
+### Number of Punctuations
+Punctuations
+```{r}
+data$num_of_puncts = str_count(data$trimmed_text, "[[:punct:]]")
+```
+
+Dollar Marks
+```{r}
+data$num_of_dollar = str_count(data$trimmed_text, "[$]")
+```
+
+Percentage Marks
+```{r}
+data$num_of_percents = str_count(data$trimmed_text, "[%]")
+```
+
+### Number of words whose characters are all capital
+```{r}
+data$num_of_capitals = str_count(data$trimmed_text,  "\\b[A-Z][A-Z][A-Z]+\\b")
+```
+
+### Number of digits
+```{r}
+data$num_of_digits = str_count(data$trimmed_text, "[[:digit:]]+")
+```
+
+Save data before the udpipe process
+```{r}
+saveRDS(data, "data_before_udpipe.rds")
+```
+
+```{r}
+data = readRDS("data_before_udpipe.rds")
+```
+
+## Text Processing
+### Tokenisation
+Udpipe model
+```{r eval=FALSE}
+# library(udpipe)
+# 
+# ud_model = udpipe_load_model(udpipe::udpipe_download_model("english"))
+# annotated_MD = udpipe_annotate(object = ud_model,
+#                              data$trimmed_text,
+#                              doc_id = data$doc_id,
+#                              parallel.cores = 8,
+#                              trace = T) %>% as.data.frame()
+# rm(ud_model)
+# 
+# saveRDS(annotated_MD, "annotated_MD.rds")
+```
+
+```{r}
+annotated_MD = readRDS("annotated_MD.rds")
+
+annotated_MD$low_lemma = tolower(annotated_MD$lemma)
+annotated_MD$doc_id = as.numeric(annotated_MD$doc_id)
+```
+
+
+#### Add feature: Number of company names mentioned
+```{r}
+annotated_MD = annotated_MD %>%
+  mutate(name_or_not = ifelse(low_lemma %in% tolower(name_list), 1, 0))
+
+data = annotated_MD %>%
+  select(doc_id, name_or_not) %>%
+  filter(name_or_not == 1) %>%
+  group_by(doc_id) %>%
+  summarise(num_of_names = sum(name_or_not)) %>%
+  left_join(data, ., by = "doc_id") %>%
+  mutate(num_of_names = ifelse(is.na(num_of_names), 0, num_of_names))
+
+# check if a word is "plc", "INC", or others
+annotated_MD = annotated_MD %>%
+  mutate(com_label = ifelse(low_lemma %in% tolower(part_of_name_list), 1, 0))
+
+# clear the memory
+rm(name_list, part_of_name_list)
+```
+
+#### Clean tokens start with "-" or "."
+Some words start with "-" may be typos, so those "-" have to be removed.
+```{r}
+annotated_MD$low_lemma = ifelse(str_starts(annotated_MD$low_lemma, "-"),
+                                str_sub(annotated_MD$low_lemma, start = 2),
+                                annotated_MD$low_lemma)
+```
+
+Some words contain "." may be typos, so those "." have to be removed.
+```{r}
+annotated_MD$low_lemma = gsub("\\.*", "", annotated_MD$low_lemma)
+```
+
+
+### Inspecting Part of speech
+```{r}
+pos_list = unique(annotated_MD$upos)
+
+for (pos in pos_list){
+  print(paste0(pos, ": ", paste(annotated_MD$low_lemma[which(annotated_MD$upos == pos)[1:10]], collapse = ", ")))
+}
+rm(pos, pos_list)
+```
+
+Calculating Tf-Idf values needs total word counts of each document, so I use all words except digits and punctuation to measure Tf-Idf values. X, PUNCT, NUM, and SYM are digits and punctuation, which are meaningless in terms of both sentiment analysis and topic modelling. Therefore, they are removed here. The rest of words are used for calculating Tf-Idf values. 
+
+```{r}
+annotated_MD_for_tfidf = annotated_MD %>%
+  filter(!upos %in% c("X", "PUNCT", "NUM", "SYM"))
+```
+
+
+NOUN, PROPN, ADJ, VERB, are ADV are meaningful for text mining, so they will be kept. Let's inspect other categories (CCONJ, ADP, DET, AUX, PRON, PART, SCONJ, INTJ).
+
+**CCONJ**
+```{r}
+( annotated_MD %>% filter(upos == "CCONJ") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+All of the CCONJ words do not have polarity scores. Therefore they will be excluded.
+
+**ADP**
+```{r}
+( annotated_MD %>% filter(upos == "ADP") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Most of the ADP words are meaningful and have a polarity score, so they will be used for further analyses.
+
+**DET**
+```{r}
+( annotated_MD %>% filter(upos == "DET") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Most of the DET words are misspelled words or have no polarity score. Excluded.
+
+**AUX**
+```{r}
+( annotated_MD %>% filter(upos == "AUX") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Most of the AUX words are meaningful, which can contribute to topic modelling solutions. Keep them.
+
+**PRON**
+```{r}
+( annotated_MD %>% filter(upos == "PRON") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Most of the PRONs are not meaningful and do not have sentiment scores. Exclude them.
+
+**PART**
+```{r}
+( annotated_MD %>% filter(upos == "PART") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Almost all PART words are meaningless. Excluded.
+
+**SCONJ**
+```{r}
+( annotated_MD %>% filter(upos == "SCONJ") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Most of the SCONJ words are meaningful, which can contribute to topic modelling solutions. Keep them.
+
+**INTJ**
+```{r}
+( annotated_MD %>% filter(upos == "INTJ") %>% select(low_lemma) %>% unique() %>% as.character() )
+```
+
+Meaningless. Excluded.
+
+#### Keep important POS words, remove company names and abbreviations
+Hence, I only keep words classified as "NOUN", "PROPN", "ADJ", "VERB", "ADV", "ADP", "AUX", and "SCONJ" for further analyses. Furthermore, I remove all company names and abbreviations such as "plc", "INC", "CORP", etc.
+```{r}
+clean_annotated_MD = annotated_MD %>%
+  filter(upos %in% c("NOUN", "PROPN", "ADJ", "VERB", "ADV", "ADP", "AUX", "SCONJ")) %>%
+  filter(name_or_not != 1) %>%
+  filter(com_label != 1)
+
+# clear the memory
+rm(annotated_MD)
+clean_annotated_MD$name_or_not = NULL
+clean_annotated_MD$com_label = NULL
+```
+
+
+### Stop words
+I compute the Tf-Idf values in filing level instead of company level because the stock prices also differ in filing level. Document frequencies are also computed.
+#### Tf-Idf stop words identification
+```{r}
+annotated_MD_tfidf = annotated_MD_for_tfidf %>%
+  select(doc_id, low_lemma) %>%
+  count(doc_id, low_lemma) %>%
+  bind_tf_idf(low_lemma, doc_id, n) %>%
+  mutate(df = 1/(exp(idf)))
+```
+
+
+**Inspect the distribution of document frequencies**
+I use document frequencies to develop my stop word dictionary instead of using Tf-Idf values because removing words that are very commonly used across the entire corpus can help us focus on more important words. 
+```{r}
+ggplot(annotated_MD_tfidf, aes(df)) + 
+  geom_histogram(binwidth = 0.01)
+```
+
+As can be seen in the histogram, there is a surge of document frequencies at about 0.97. It seems there is a growth of words that appear in 97% of the documents.
+
+```{r}
+View( annotated_MD_tfidf %>% 
+  filter(df > 0.97) %>%
+    select(low_lemma, df) %>%
+    unique() %>%
+    arrange(low_lemma) )
+```
+
+There are 203 words whose document frequency is larger than 0.97. It means those words appear in 97% of the documents and hence they are not representative for documents. Moreover, most of them are fairly common in English. They will be treated as stop words.
+
+```{r}
+# Constructing a stop word dictionary on document frequencies
+df_stopwords = annotated_MD_tfidf %>% 
+  filter(df > 0.97) %>%
+  select(low_lemma) %>%
+  mutate(lexicon = "doc_freq") %>%
+  rename(word = low_lemma) %>%
+  unique()
+```
+
+
+**Inspect the distribution of document frequencies**
+I am going to directly remove words that have a low value of Tf-Idf instead of constructing a stop word lexicon because one word can have multiple Tf-Idf values. For example, assume that there is a word that has a high value of Tf-Idf in one document and has a low Tf-Idf value in another document. If I anti join a dictionary of Tf-Idf stop words, the word in both documents will be dropped.
+```{r}
+ggplot(annotated_MD_tfidf, aes(tf_idf)) + 
+  geom_histogram(binwidth = 0.00001) + 
+  xlim(0, 0.003) +
+  ylim(0, 45000)
+```
+
+Examine words that have a low Tf-Idf value
+```{r}
+annotated_MD_tfidf %>%
+  filter(tf_idf < 0.0001) %>%
+  select(low_lemma) %>%
+  unique()
+```
+
+remove words that have a small value of Tf-Idf
+```{r}
+clean_annotated_MD = clean_annotated_MD %>%
+  left_join(annotated_MD_tfidf %>% select(doc_id, low_lemma, tf_idf), 
+            by = c("doc_id", "low_lemma"))
+
+clean_annotated_MD = clean_annotated_MD %>%
+  filter(tf_idf < 0.0001) %>%
+  select(-tf_idf)
+```
+
+
+#### The overall stop word dictionary
+```{r}
+my_stopwords = stop_words %>%
+  rbind(df_stopwords)
+```
+
+#### Remove stop words
+```{r}
+no_stop_MD = clean_annotated_MD %>%
+  select(doc_id, low_lemma) %>%
+  anti_join(my_stopwords, by = c("low_lemma" = "word"))
+
+# clear the memory
+rm(df_stopwords, annotated_MD_for_tfidf, annotated_MD_tfidf, my_stopwords, clean_annotated_MD)
+```
+
+
+### remove short or extremely long tokens
+```{r}
+no_stop_MD$length = nchar(no_stop_MD$low_lemma)
+
+min(no_stop_MD$length)
+max(no_stop_MD$length)
+
+
+ggplot(no_stop_MD, aes(x = length)) + geom_histogram(binwidth = 1)
+
+View(no_stop_MD %>% select(low_lemma, length) %>% unique() %>% arrange(desc(length)) )
+View(no_stop_MD %>% select(low_lemma, length) %>% unique() %>% arrange(length) )
+```
+
+It seems tokens shorter than 3 are either typos or meaningless. They should all be removed. 
+```{r}
+no_stop_MD = no_stop_MD %>%
+  filter(length >= 3)
+```
+
+
+### Detokenising clean tokens
+```{r}
+clean_data = no_stop_MD %>%
+  group_by(doc_id) %>%
+  summarise(clean_MD_text = paste(low_lemma, collapse = " ")) %>%
+  left_join(data, ., by = "doc_id") %>%
+  select(-md_text, -no_contraction_text, -trimmed_text)
+
+clean_data$num_of_clean_words = str_count(clean_data$clean_MD_text, "\\b[A-Za-z]+\\b")
+
+# clear the memory
+rm(no_stop_MD, data)
+
+# Save for further uses
+saveRDS(clean_data, "clean_data.rds")
+```
+
+
+## Task: Important keywords across the industry level (GICS)
+```{r}
+clean_data = readRDS("clean_data.rds")
+
+View(head(clean_data))
+
+unique(clean_data$`GICS Sub Industry`)
+```
+
+### Keywords on the year level
+Calculate Tf-Idf values on the year level
+```{r}
+year_tfidf = clean_data %>%
+  unnest_tokens(input = clean_MD_text, output = word) %>%
+  count(year, word) %>%
+  bind_tf_idf(word, year, n) %>%
+  ungroup()
+```
+
+Examine if there is any drastical change of keywords during the entire span
+```{r}
+year_tfidf %>%
+  group_by(year) %>%
+  arrange(year, desc(tf_idf)) %>%
+  top_n(10, tf_idf) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder(word, tf_idf, .desc = F)) %>%
+  ggplot(aes(x = word, y = tf_idf, fill = as.factor(year))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Tf-Idf", title = "IMPORTANT KEYWORDS", subtitle = "grouped by years") +
+  facet_wrap(~year, scales = "free", ncol = 4) +
+  coord_flip() 
+```
+
+
+### Keywords on the industry level
+#### Overall Keywords across the entire span
+```{r}
+industry_tfidf = clean_data %>%
+  unnest_tokens(input = clean_MD_text, output = word) %>%
+  count(`GICS Sub Industry`, word) %>%
+  bind_tf_idf(word, `GICS Sub Industry`, n) %>%
+  ungroup()
+```
+
+Examine the differences of keywords in different industries
+```{r}
+industry_tfidf %>%
+  group_by(`GICS Sub Industry`) %>%
+  arrange(`GICS Sub Industry`, desc(tf_idf)) %>%
+  top_n(10, tf_idf) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder(word, tf_idf, .desc = F)) %>%
+  ggplot(aes(x = word, y = tf_idf, fill = as.factor(`GICS Sub Industry`))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Tf-Idf", title = "IMPORTANT KEYWORDS", subtitle = "grouped by GICS sector") +
+  facet_wrap(~`GICS Sub Industry`, scales = "free", ncol = 4) +
+  coord_flip() 
+```
+
+
+#### Effects of the pandemic examination
+**Data after the pandemic (the pandemic was declared by WHO on 11 March 2020)**
+```{r}
+industry_tfidf_after = clean_data %>%
+  filter(date.filed > ymd("2020-03-11")) %>%
+  unnest_tokens(input = clean_MD_text, output = word) %>%
+  count(`GICS Sub Industry`, word) %>%
+  bind_tf_idf(word, `GICS Sub Industry`, n) %>%
+  ungroup()
+```
+
+There are only 3 industries ("Communications Equipment", "Electronic Equipment & Instruments", "Semiconductors") filed after the declaration of the pandemic, so only these 3 industries will be compared.
+```{r}
+compared_industries = unique(industry_tfidf_after$`GICS Sub Industry`)
+```
+
+**Data before the pandemic**
+```{r}
+industry_tfidf_before = clean_data %>%
+  filter(`GICS Sub Industry` %in% compared_industries) %>%
+  filter(date.filed <= ymd("2020-03-11")) %>%
+  unnest_tokens(input = clean_MD_text, output = word) %>%
+  count(`GICS Sub Industry`, word) %>%
+  bind_tf_idf(word, `GICS Sub Industry`, n) %>%
+  ungroup()
+```
+
+Examine the differences of keywords in different industries
+```{r}
+library(ggpubr)
+
+# Before the pandemic
+g1 = industry_tfidf_before %>%
+  group_by(`GICS Sub Industry`) %>%
+  arrange(`GICS Sub Industry`, desc(tf_idf)) %>%
+  top_n(10, tf_idf) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder(word, tf_idf, .desc = F)) %>%
+  ggplot(aes(x = word, y = tf_idf, fill = as.factor(`GICS Sub Industry`))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Tf-Idf", title = "KEYWORDS BEFORE PANDEMIC", subtitle = "grouped by GICS sector") +
+  facet_wrap(~`GICS Sub Industry`, scales = "free", ncol = 4) +
+  coord_flip() 
+
+# After the pandemic
+g2 = industry_tfidf_after %>%
+  group_by(`GICS Sub Industry`) %>%
+  arrange(`GICS Sub Industry`, desc(tf_idf)) %>%
+  top_n(10, tf_idf) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder(word, tf_idf, .desc = F)) %>%
+  ggplot(aes(x = word, y = tf_idf, fill = as.factor(`GICS Sub Industry`))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Tf-Idf", title = "KEYWORDS AFTER PANDEMIC", subtitle = "grouped by GICS sector") +
+  facet_wrap(~`GICS Sub Industry`, scales = "free", ncol = 4) +
+  coord_flip() 
+
+ggarrange(g1, g2, labels = c("A", "B"), nrow = 2)
+```
+
+
+```{r}
+# clear the memory
+rm(year_tfidf, industry_tfidf_after, industry_tfidf_before, industry_tfidf, compared_industries, g1, g2)
+```
+
+---
+
+# Part B: Sentiment association with Financial Indicators
+## Import data
+```{r}
+clean_data = readRDS("clean_data.rds")
+```
+
+## Sentiment Analysis on the entire data
+### analyzeSentiment function
+```{r}
+anal_Sent_data = clean_data %>%
+  select(doc_id, clean_MD_text) %>%
+  cbind(analyzeSentiment(clean_data$clean_MD_text)) %>%
+  select(doc_id, SentimentGI, SentimentHE, SentimentLM, RatioUncertaintyLM, SentimentQDAP)
+```
+
+
+### QDAP polarity
+```{r eval=FALSE}
+qdap_data = data.frame()
+for (i in 1:nrow(clean_data)){
+  temp = data.frame(doc_id = clean_data$doc_id[i]) %>%
+    cbind(qdap::polarity(clean_data$clean_MD_text[i]))
+  qdap_data = qdap_data %>%
+    rbind(temp)
+}
+rm(temp, i)
+
+qdap_data = qdap_data %>%
+  select(doc_id, all.polarity) %>%
+  rename(QDAP_SENT = all.polarity)
+
+saveRDS(qdap_data, "qdap_data.rds")
+```
+
+```{r}
+qdap_data = readRDS("qdap_data.rds")
+```
+
+
+### Get_sentiments function
+Tokenisation
+```{r}
+clean_tokens = clean_data %>%
+  select(doc_id, clean_MD_text) %>%
+  unnest_tokens(input = clean_MD_text, output = word)
+```
+
+**Bing dictionary (only positive and negative)**
+```{r}
+# get_sentiments("bing") %>%
+#   count(sentiment)
+
+Bing_data = clean_tokens %>%
+  inner_join(get_sentiments("bing"), by = "word")
+
+Bing_data = Bing_data %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(BING_SENT = (positive - negative)/((positive + negative)),
+         word.count = negative + positive) %>%
+  mutate(BING_negative = negative/word.count,
+         BING_positive = positive/word.count) %>%
+  select(doc_id, BING_positive, BING_negative, BING_SENT)
+```
+
+**Loughran dictionary (particularly for financial analysis)**
+```{r}
+# get_sentiments("loughran") %>%
+#   count(sentiment)
+
+Loughran_data = clean_tokens %>%
+  inner_join(get_sentiments("loughran"), by = "word")
+# There is no superfluous words
+
+Loughran_data = Loughran_data %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(LM_SENT = (positive - negative)/((positive + negative)),
+         word.count = constraining + litigious + negative + positive + uncertainty) %>%
+  mutate(LM_constraining = constraining/word.count,
+         LM_litigious = litigious/word.count,
+         LM_negative = negative/word.count,
+         LM_positive = positive/word.count,
+         LM_uncertainty = uncertainty/word.count) %>%
+  select(doc_id, LM_constraining, LM_litigious, LM_negative, LM_positive, LM_uncertainty, LM_SENT)
+
+```
+
+**NRC dictionary (feelings)**
+```{r}
+# get_sentiments("nrc") %>%
+#   count(sentiment)
+
+NRC_data = clean_tokens %>%
+  inner_join(get_sentiments("nrc"), by = "word")
+
+NRC_data = NRC_data %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(NRC_SENT = (positive - negative)/((positive + negative)),
+         word.count = anger + anticipation + disgust + fear + joy + negative + positive + sadness + surprise + trust) %>%
+  mutate(NRC_anger = anger/word.count,
+         NRC_anticipation = anticipation/word.count,
+         NRC_disgust = disgust/word.count,
+         NRC_fear = fear/word.count,
+         NRC_joy = joy/word.count,
+         NRC_negative = negative/word.count,
+         NRC_positive = positive/word.count,
+         NRC_sadness = sadness/word.count,
+         NRC_surprise = surprise/word.count,
+         NRC_trust = trust/word.count) %>%
+  select(doc_id, NRC_anger, NRC_anticipation, NRC_disgust, NRC_fear, NRC_joy, NRC_negative, NRC_positive, NRC_sadness, NRC_surprise, NRC_trust, NRC_SENT)
+```
+
+**Afinn dictionary (sentiment scores from -5 to 5)**
+```{r}
+# get_sentiments("afinn") %>%
+#   count(value)
+
+Afinn_data = clean_tokens %>%
+  inner_join(get_sentiments("afinn"), by = "word")
+
+Afinn_data = Afinn_data %>% 
+  group_by(doc_id) %>%
+  summarise(AFINN_SENT = sum(value))
+```
+
+#### Combine Bing, NRC, Afinn, Loughran labelled data
+```{r}
+four_in_one_data = Afinn_data %>%
+  left_join(Bing_data) %>%
+  left_join(Loughran_data) %>%
+  left_join(NRC_data)
+
+rm(Afinn_data, Bing_data, Loughran_data, NRC_data)
+```
+
+### Combine all sentiment data
+```{r}
+sentiment_data = four_in_one_data %>%
+  left_join(qdap_data) %>%
+  left_join(anal_Sent_data)
+
+rm(four_in_one_data, qdap_data, anal_Sent_data, clean_tokens)
+
+# two documents have NaN LM sentiments because their LM_positive and LM_negative are both zero
+sentiment_data[is.na(sentiment_data)] = 0
+```
+
+## Regressions
+### Construct a data frame for regressions
+```{r}
+regression_data = clean_data %>%
+  select(-CIK, -Symbol, -`GICS Sub Industry`, -company.name, -date.filed, -date_before_filing, -date_after_filing, -price_before, -price_after, -clean_MD_text) %>%
+  left_join(sentiment_data, .) %>%
+  select(price_change, everything()) %>%
+  na.omit()
+
+```
+
+
+Check the distribution of price changes
+```{r}
+ggplot(regression_data, aes(price_change)) + geom_histogram(binwidth = 0.005)
+```
+
+It is quite a normal distribution so that no transformation will be conducted.
+
+
+Standardising data
+```{r}
+z_regression_data = regression_data %>%
+  as.matrix() %>%
+  scale() %>%
+  as.data.frame()
+```
+
+### Correlations
+```{r}
+library(corrplot)
+
+cor(z_regression_data %>% select(-doc_id))
+
+corrplot(cor(z_regression_data %>% select(-doc_id)))
+```
+
+
+### Select the best set of variables for predicting stock prices
+Build a regression model
+```{r}
+m_price_by_sent = lm(price_change ~., data = z_regression_data %>% select(-doc_id))
+```
+
+Use stepAIC function from the MASS package to stepwisely select variables
+```{r message=FALSE, results = 'hide'}
+m_price_by_sent_best = MASS::stepAIC(m_price_by_sent, direction = "backward")
+```
+
+```{r}
+summary(m_price_by_sent_best)
+
+( m_sent_summary = as.data.frame(summary(m_price_by_sent_best)$coefficient) %>%
+    rename(p_value = `Pr(>|t|)`) %>%
+    filter(p_value < 0.05) )
+
+row.names(m_sent_summary)
+```
+
+In this section, I have proven that the correlations between the stock price changes and the sentiment scores are not quite significantly strong. So far, only the NRC negative scores, the NRC sentiment scores, the number of words after tidying, the number of percent signs, and the uncertainty ratios from Loughran are significantly predictive to the changes of stock prices. In fact, only the number of percent signs have a positive effect on the stock price changes. In other words, adding 1 percent sign will lead to 0.1104 units of log stock price changes. All the other variables negatively affect the stock price changes. On the other hand, the overall adjusted R-squared is 0.01517 and the p-value is 0.01993. This shows that the model can only explain 1.52% of variances of the stock price changes. This R squared may still be improved once variables from topic modelling in part C are added.
+
+```{r}
+# clear the memory
+rm(m_price_by_sent, m_price_by_sent_best, m_sent_final, m_sent_summary, regression_data, z_regression_data)
+```
+
+
+## Inspect Sentiment Changes during the pandemic
+Check if there was any dramatic sentiment difference after the pandemic was declared
+
+### Construct sentiment data before the pandemic
+```{r}
+clean_data_before = clean_data %>%
+  filter(date.filed <= ymd("2020-03-11"))
+
+clean_tokens_before = clean_data_before %>%
+  select(doc_id, clean_MD_text) %>%
+  unnest_tokens(input = clean_MD_text, output = word)
+
+# analyzeSentiment
+anal_Sent_data_before = clean_data_before %>%
+  select(doc_id, clean_MD_text) %>%
+  cbind(analyzeSentiment(clean_data_before$clean_MD_text)) %>%
+  select(doc_id, SentimentGI, SentimentHE, SentimentLM, RatioUncertaintyLM, SentimentQDAP)
+```
+
+```{r eval=FALSE}
+# qdap polarity
+qdap_data_before = data.frame()
+for (i in 1:nrow(clean_data_before)){
+  temp = data.frame(doc_id = clean_data_before$doc_id[i]) %>%
+    cbind(qdap::polarity(clean_data_before$clean_MD_text[i]))
+  qdap_data_before = qdap_data_before %>%
+    rbind(temp)
+}
+rm(temp, i)
+qdap_data_before = qdap_data_before %>%
+  select(doc_id, all.polarity) %>%
+  rename(QDAP_SENT = all.polarity)
+saveRDS(qdap_data_before, "qdap_data_before.rds")
+```
+
+```{r}
+qdap_data_before = readRDS("qdap_data_before.rds")
+
+# bing
+Bing_data_before = clean_tokens_before %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(BING_SENT = (positive - negative)/((positive + negative))) %>%
+  select(doc_id, BING_SENT)
+
+# loughran
+Loughran_data_before = clean_tokens_before %>%
+  inner_join(get_sentiments("loughran"), by = "word") %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(LM_SENT = (positive - negative)/((positive + negative))) %>%
+  select(doc_id, LM_SENT)
+Loughran_data_before[is.na(Loughran_data_before)] = 0
+
+# NRC
+NRC_data_before = clean_tokens_before %>%
+  inner_join(get_sentiments("nrc"), by = "word") %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(NRC_SENT = (positive - negative)/((positive + negative))) %>%
+  select(doc_id, NRC_SENT)
+
+# combine all sentiment data
+sentiment_data_before = anal_Sent_data_before %>%
+  left_join(qdap_data_before) %>%
+  left_join(Bing_data_before) %>%
+  left_join(Loughran_data_before) %>%
+  left_join(NRC_data_before)
+
+rm(qdap_data_before, Bing_data_before, Loughran_data_before, NRC_data_before, clean_tokens_before, anal_Sent_data_before)
+```
+
+
+### Construct sentiment data after the pandemic
+```{r}
+clean_data_after = clean_data %>%
+  filter(date.filed > ymd("2020-03-11"))
+
+clean_tokens_after = clean_data_after %>%
+  select(doc_id, clean_MD_text) %>%
+  unnest_tokens(input = clean_MD_text, output = word)
+
+# analyzeSentiment
+anal_Sent_data_after = clean_data_after %>%
+  select(doc_id, clean_MD_text) %>%
+  cbind(analyzeSentiment(clean_data_after$clean_MD_text)) %>%
+  select(doc_id, SentimentGI, SentimentHE, SentimentLM, RatioUncertaintyLM, SentimentQDAP)
+```
+
+```{r eval=FALSE}
+# qdap polarity
+qdap_data_after = data.frame()
+for (i in 1:nrow(clean_data_after)){
+  temp = data.frame(doc_id = clean_data_after$doc_id[i]) %>%
+    cbind(qdap::polarity(clean_data_after$clean_MD_text[i]))
+  qdap_data_after = qdap_data_after %>%
+    rbind(temp)
+}
+rm(temp, i)
+qdap_data_after = qdap_data_after %>%
+  select(doc_id, all.polarity) %>%
+  rename(QDAP_SENT = all.polarity)
+saveRDS(qdap_data_after, "qdap_data_after.rds")
+```
+
+```{r}
+qdap_data_after = readRDS("qdap_data_after.rds")
+
+# bing
+Bing_data_after = clean_tokens_after %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(BING_SENT = (positive - negative)/((positive + negative))) %>%
+  select(doc_id, BING_SENT)
+
+# loughran
+Loughran_data_after = clean_tokens_after %>%
+  inner_join(get_sentiments("loughran"), by = "word") %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(LM_SENT = (positive - negative)/((positive + negative))) %>%
+  select(doc_id, LM_SENT)
+
+# NRC
+NRC_data_after = clean_tokens_after %>%
+  inner_join(get_sentiments("nrc"), by = "word") %>%
+  group_by(doc_id) %>%
+  count(sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(NRC_SENT = (positive - negative)/((positive + negative))) %>%
+  select(doc_id, NRC_SENT)
+
+# combine all sentiment data
+sentiment_data_after = anal_Sent_data_after %>%
+  left_join(qdap_data_after) %>%
+  left_join(Bing_data_after) %>%
+  left_join(Loughran_data_after) %>%
+  left_join(NRC_data_after)
+
+rm(qdap_data_after, Bing_data_after, Loughran_data_after, NRC_data_after, clean_tokens_after, anal_Sent_data_after)
+```
+
+### Compare
+```{r}
+sentiment_data_before %>%
+  pivot_longer(-doc_id, names_to = "Dictionary", values_to = "Sentiment") %>%
+  group_by(Dictionary) %>%
+  summarise(AVG_Sentiment_before = mean(Sentiment)) %>%
+  inner_join(
+    sentiment_data_after %>%
+      pivot_longer(-doc_id, names_to = "Dictionary", values_to = "Sentiment") %>%
+      group_by(Dictionary) %>%
+      summarise(AVG_Sentiment_after = mean(Sentiment)), by = "Dictionary") %>%
+  pivot_longer(-Dictionary, names_to = "Pandemic", values_to = "Sentiment") %>%
+  mutate(Pandemic = gsub("AVG_Sentiment_", "", Pandemic)) %>%
+  ggplot(aes(x = Dictionary, y = Sentiment, fill = as.factor(Pandemic))) +
+  geom_col() +
+  labs(title = "The Effect of Pandemic on Sentiment Scores", x = "Dictionary", y = "Sentiment Score", fill = "Pandemic") +
+  ylim(-1, 2.4) +
+  coord_flip()
+```
+
+As shown in the plot, the management discussions became more emotional. Magnitudes of sentiment scores after the pandemic are all significantly larger than those before the pandemic. However, the result is still unstable as only few management discussions are available so far. Therefore, collecting and analysing more data after the pandemic can be further developed in the future research.
+
+```{r}
+# clear the memory
+rm(clean_data_after, clean_data_before, sentiment_data_after, sentiment_data_before)
+```
+
+---
+
+# Part C: Topic Modelling and Latent Dirichlet allocation
+## Import the dataset
+```{r}
+clean_data = readRDS("clean_data.rds")
+```
+
+
+## Text processing
+```{r}
+# Stop words have already been removed
+MD_text_processed = textProcessor(clean_data$clean_MD_text,
+                          metadata = clean_data,
+                          stem = F)
+
+# setting the threshold
+threshold = round(1/100 * length(MD_text_processed$documents),0)
+
+MD_text_out = prepDocuments(MD_text_processed$documents,
+                    MD_text_processed$vocab,
+                    MD_text_processed$meta,
+                    lower.thresh = threshold)
+
+rm(threshold)
+```
+
+No document is removed.
+
+
+## STM modelling
+### Find the best value of k
+Adapt the concept of gradient descent algorithm to find the locally optimal number of topics. It is an unsupervised process. Firstly, setting k = 0 in the stm function is used to derive the initial feasible solution. Later, the searchK function is implemented to search better models close to the initial solution.
+
+#### Set K = 0 in the stm function
+First Iteration
+```{r eval=FALSE}
+stm_unsupervised = stm(documents = MD_text_out$documents,
+                   vocab = MD_text_out$vocab,
+                   K = 0,
+                   prevalence = ~price_change,
+                   max.em.its = 75,
+                   data = MD_text_out$meta,
+                   reportevery = 5,
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+
+saveRDS(stm_unsupervised, "stm_unsupervised.rds")
+```
+
+```{r}
+stm_unsupervised = readRDS("stm_unsupervised.rds")
+
+# Check the topic model and topic proportions
+plot(stm_unsupervised)
+
+# Inspect the topic distribution
+topicQuality(stm_unsupervised, document = MD_text_out$documents)
+```
+
+Choosing a model by exclusivity and Semantic Coherence is a tradeoff. A model with more topics tend to have a lower semantic coherence and a higher exclusivity
+
+Review FREX words for every topic
+```{r}
+topicProportions = colMeans(stm_unsupervised$theta)
+stm_unsupervised_summary = summary(stm_unsupervised)
+
+unsupervised_frex = data.frame()
+for (i in 1:length(stm_unsupervised_summary$topicnums)){
+  row_here = data.frame(topic_num = stm_unsupervised_summary$topicnums[i],
+                        proportion = 100 * round(topicProportions[i], 4),
+                        frex_words = paste(stm_unsupervised_summary$frex[i, 1:7], collapse = ", "))
+  unsupervised_frex = rbind(row_here, unsupervised_frex)
+}
+rm(i, row_here)
+
+# View(unsupervised_frex %>%
+#   arrange(desc(proportion)))
+```
+
+The unsupervised model suggests 74 topics. However, it seems there are many overlaps between topics.
+
+Detect stop words which appear in many topics
+```{r}
+stm_unsupervised_high_prob_words = data.frame(stm_unsupervised_summary$prob)
+colnames(stm_unsupervised_high_prob_words) = paste0("word_", 1:7)
+stm_unsupervised_high_prob_words$topic = paste0("topic_", 1:length(stm_unsupervised_summary$topicnums))
+stm_unsupervised_high_prob_words = stm_unsupervised_high_prob_words %>%
+  unite("Text", word_1:word_7, remove = TRUE, sep = " ") %>%
+  unnest_tokens(input = Text, output = word) %>%
+  count(topic, word) %>%
+  bind_tf_idf(word, topic, n) %>%
+  mutate(df = 1/exp(idf)) %>%
+  select(word, df) %>%
+  unique() %>%
+  mutate(num_of_topics = df * length(stm_unsupervised_summary$topicnums)) %>%
+  arrange(desc(df))
+
+stm_unsupervised_high_prob_words %>%
+  top_n(50, df) %>%
+  mutate(word = fct_reorder(word, df, .desc = FALSE)) %>%
+  ggplot(aes(x = word, y = num_of_topics)) +
+  geom_col(show.legend = FALSE, fill = "darkcyan") +
+  labs(title = "Topic Frequencies of Words", subtitle = paste0("Derived from the stm unsupervised model with ", length(stm_unsupervised_summary$topicnums), " topics"), y = "Number of Topics", x = "Word") +
+  coord_flip()
+
+topic_stopwords = stm_unsupervised_high_prob_words %>%
+  filter(df > 0.15) %>%
+  mutate(lexicon = "topic_df") %>%
+  select(word, lexicon)
+```
+
+
+Second Iteration: remove stop words on the topic level
+```{r}
+MD_text_processed2 = textProcessor(clean_data$clean_MD_text,
+                          metadata = clean_data,
+                          customstopwords = topic_stopwords$word,
+                          stem = F)
+
+# setting the threshold
+threshold = round(1/100 * length(MD_text_processed2$documents),0)
+MD_text_out2 = prepDocuments(MD_text_processed2$documents,
+                    MD_text_processed2$vocab,
+                    MD_text_processed2$meta,
+                    lower.thresh = threshold)
+rm(threshold)
+```
+
+```{r eval=FALSE}
+# unsupervised
+stm_unsupervised2 = stm(documents = MD_text_out2$documents,
+                   vocab = MD_text_out2$vocab,
+                   K = 0,
+                   prevalence = ~price_change,
+                   max.em.its = 75,
+                   data = MD_text_out2$meta,
+                   reportevery = 5,
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+saveRDS(stm_unsupervised2, "stm_unsupervised2.rds")
+```
+
+```{r}
+stm_unsupervised2 = readRDS("stm_unsupervised2.rds")
+# Check the topic model and topic proportions
+plot(stm_unsupervised2)
+
+# Inspect the topic distribution
+topicQuality(stm_unsupervised2, document = MD_text_out2$documents)
+```
+
+```{r}
+topicProportions2 = colMeans(stm_unsupervised2$theta)
+stm_unsupervised_summary2 = summary(stm_unsupervised2)
+unsupervised_frex2 = data.frame()
+for (i in 1:length(stm_unsupervised_summary2$topicnums)){
+  row_here = data.frame(topic_num = stm_unsupervised_summary2$topicnums[i],
+                        proportion = 100 * round(topicProportions2[i], 4),
+                        frex_words = paste(stm_unsupervised_summary2$frex[i, 1:7], collapse = ", "))
+  unsupervised_frex2 = rbind(row_here, unsupervised_frex2)
+}
+rm(i, row_here)
+
+stm_unsupervised_high_prob_words2 = data.frame(stm_unsupervised_summary2$prob)
+colnames(stm_unsupervised_high_prob_words2) = paste0("word_", 1:7)
+stm_unsupervised_high_prob_words2$topic = paste0("topic_", 1:length(stm_unsupervised_summary2$topicnums))
+stm_unsupervised_high_prob_words2 = stm_unsupervised_high_prob_words2 %>%
+  unite("Text", word_1:word_7, remove = TRUE, sep = " ") %>%
+  unnest_tokens(input = Text, output = word) %>%
+  count(topic, word) %>%
+  bind_tf_idf(word, topic, n) %>%
+  mutate(df = 1/exp(idf)) %>%
+  select(word, df) %>%
+  unique() %>%
+  mutate(num_of_topics = df * length(stm_unsupervised_summary2$topicnums)) %>%
+  arrange(desc(df))
+
+stm_unsupervised_high_prob_words2 %>%
+  top_n(50, df) %>%
+  mutate(word = fct_reorder(word, df, .desc = FALSE)) %>%
+  ggplot(aes(x = word, y = num_of_topics)) +
+  geom_col(show.legend = FALSE, fill = "darkcyan") +
+  labs(title = "Topic Frequencies of Words", subtitle = paste0("Derived from the stm unsupervised model with ", length(stm_unsupervised_summary2$topicnums), " topics"), y = "Number of Topics", x = "Word") +
+  coord_flip()
+```
+
+It looks better than the previous model as the exclusivity increases. Another, there are fewer overlaps in this model as all topic frequencies of words are not larger than 0.3. Therefore, 70-topic result is the initial solution.
+
+```{r}
+# clear the memory
+rm(MD_text_out, MD_text_processed, MD_text_out2, MD_text_processed2, stm_unsupervised, stm_unsupervised_high_prob_words, stm_unsupervised_high_prob_words2, stm_unsupervised_summary, stm_unsupervised_summary2, stm_unsupervised2, unsupervised_frex, unsupervised_frex2, topicProportions, topicProportions2)
+```
+
+#### SearchK
+Setting the parametre grid
+```{r}
+grid = 60:80
+```
+
+Preprocessing
+```{r}
+initial_processed = textProcessor(clean_data$clean_MD_text,
+                          metadata = clean_data,
+                          customstopwords = topic_stopwords$word,
+                          stem = F)
+
+# setting the threshold
+threshold = round(1/100 * length(initial_processed$documents),0)
+initial_out = prepDocuments(initial_processed$documents,
+                    initial_processed$vocab,
+                    initial_processed$meta,
+                    lower.thresh = threshold)
+rm(threshold)
+```
+
+No document was removed.
+
+Start searching local optimal number of topics
+```{r eval=FALSE}
+num_topics = searchK(initial_out$documents,
+                     initial_out$vocab,
+                     K = grid)
+
+saveRDS(num_topics, "num_topics.rds")
+
+rm(grid)
+```
+
+```{r}
+num_topics = readRDS("num_topics.rds")
+
+plot(num_topics)
+```
+
+According to the plot, 61 will be set as the final best number of topics because the held-out likelihood is the highest, the semantic coherence and the residuals are the lowest at K = 61.
+
+
+### Final topic model with 61 topics
+```{r}
+final_processed = initial_processed
+final_out = initial_out
+
+rm(initial_out, initial_processed)
+```
+
+```{r eval=FALSE}
+final_topic_model = stm(documents = final_out$documents,
+                   vocab = final_out$vocab,
+                   K = 61,
+                   prevalence =~ price_change,
+                   max.em.its = 150, 
+                   data = final_out$meta,
+                   reportevery = 5,
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+saveRDS(final_topic_model, "final_topic_model.rds")
+```
+
+```{r}
+final_topic_model = readRDS("final_topic_model.rds")
+
+# plot the model
+plot(final_topic_model)
+
+# construct a model data frame with frex words and proportions
+final_topic_model_summary = summary(final_topic_model)
+final_topic_proportions = colMeans(final_topic_model$theta)
+topic_labels = paste0("topic_",1:length(final_topic_model_summary$topicnums))
+final_topic_labels = data.frame()
+for(i in 1:length(final_topic_model_summary$topicnums)){
+   row_here = data.frame(topicnum = final_topic_model_summary$topicnums[i],
+                         topic_label = topic_labels[i],
+                         proportion = 100*round(final_topic_proportions[i],4),
+                         frex_words = paste(final_topic_model_summary$frex[i,1:7], collapse = ", "))
+   final_topic_labels = rbind(row_here, final_topic_labels)
+}
+rm(row_here, topic_labels, final_topic_proportions, i)
+
+
+final_topic_labels %>%
+  mutate(topic_label = fct_reorder(topic_label, proportion, .desc = FALSE)) %>%
+  ggplot(aes(x = topic_label, y = proportion)) +
+  geom_col(show.legend = FALSE, fill = "darkcyan") +
+  labs(title = "Topic Proportions", subtitle = "from topic model with 61 topics", x = "Topic Label", y = "Proportion (%)") +
+  coord_flip()
+```
+
+It is not easy to interpret all 61 topics. Hence, I have to reduce the number of topics. It is dimension reduction. According to the lecture materials of factor analysis from the module Advanced Data Analysis, I can keep first several factors (topics) that explain about 60% of information contained in the original variables if the purpose is to reduce the data dimension. 
+
+```{r}
+cumulative_proportions = data.frame()
+for (i in 1:61){
+  a = final_topic_labels %>% arrange(desc(proportion))
+  b = a$topic_label[i]
+  cumulative_proportion = sum(a$proportion[1:i])
+  temp = data.frame(number_of_topic_kept = i, new_add_topic = b, cumulative_proportion)
+  cumulative_proportions = cumulative_proportions %>%
+    rbind(temp)
+}
+rm(i, a, b, temp, cumulative_proportion)
+
+ggplot(cumulative_proportions, aes(x = number_of_topic_kept, y = cumulative_proportion)) +
+  geom_col(show.legend = FALSE, fill = "darkcyan") + 
+  geom_hline(yintercept = 60, linetype="dashed", color = "red", size = 1) +
+  labs(title = "Cumulative Proportions", subtitle = "from topic model with 61 topics", x = "Number of Topics Kept", y = "Cumulative Information (%)")
+
+# get label of the top 19 topics
+top_19_topic_labels = cumulative_proportions$new_add_topic[1:19]
+```
+
+As shown in the plot, the top 19 topics can explain 60.38% of the overall information. 
+
+### Interpretation of the top 19 topics
+```{r}
+(final_topic_labels %>% 
+  arrange(desc(proportion)) %>%
+  top_n(19, proportion) %>%
+  select(-topicnum, -proportion))
+```
+
+
+```{r}
+# clear the memory
+rm(final_out, final_processed, final_topic_labels, final_topic_model_summary, num_topics, topic_stopwords, cumulative_proportions)
+```
+
+
+## Regressions
+### Construct topic features
+```{r}
+# document-topic matrix (contain 61 topics)
+final_model_theta = as.data.frame(final_topic_model$theta)
+colnames(final_model_theta) = paste0("topic_",1:61)
+
+top_19_topic_theta = final_model_theta %>%
+  select(top_19_topic_labels)
+```
+
+### The predictability of topic features on estimating the stock price.
+```{r}
+topic_regression_data = clean_data %>%
+  select(doc_id, price_change) %>%
+  cbind(top_19_topic_theta)
+
+m_topic_test = lm(price_change ~., data = topic_regression_data %>% select(-doc_id))
+summary(m_topic_test)
+```
+
+
+
+### Predict the stock price changes with all derived features
+Combine all features
+```{r}
+overall_features_regression_data = clean_data %>%
+  select(doc_id, price_change, ARI, Flesch.Kincaid, Linsear.Write, formality, total_num_of_words, num_of_puncts, num_of_dollar, num_of_percents, num_of_capitals, num_of_digits, num_of_names, num_of_clean_words) %>%
+  left_join(sentiment_data, by = "doc_id") %>%
+  cbind(top_19_topic_theta)
+```
+
+Standardising data
+```{r}
+z_overall_features_regression_data = overall_features_regression_data %>%
+  as.matrix() %>%
+  scale() %>%
+  as.data.frame()
+```
+
+Modelling
+```{r}
+m_overall = lm(price_change~., data = z_overall_features_regression_data %>% select(-doc_id))
+summary(m_overall)
+```
+
+The adjusted R squared is quite small (-0.005761), and the p-value is 0.6045, which indicates that the model is not significantly predictive. Hence, stepAIC must be applied to find the optimal model.
+
+
+**Choose the best model with stepAIC**
+```{r}
+m_overall_best = MASS::stepAIC(m_overall, direction = "backward")
+
+summary(m_overall_best)
+```
+
+Finally, only 8 variables (topics) are predictive to the stock price changes. The adjusted R squared is 0.02831 and the p-value is 0.001579, which show that this final model can significantly explain 2.83% of variances of the stock price changes. Moreover, the number of percent signs, topic_43, and topic_25 have positive affects to the stock price changes. On the contrary, the total number of words, the negative scores and the sentiment scores from the NRC dictionary, the uncertainty ratio from the Loughran dictionary, and topic_34 negatively affect to the stock price changes. In conclusion, similar to the result from part B, the correlations between the stock price changes and the other features are extremely limited. 
+
+
+---

@@ -1,4 +1,4 @@
-# TextAnalytics Individual Assignment (MSBA 2021)
+# Text Analytics Individual Project (MSBA 2020/21)
 
 The project analysed the management discussions in the 10-K datasets. The project aimed to detect useful relationships between the management discussions and stock prices. The download process was done in Python and the analysis process, including data preparation, sentiment analysis, and topic modelling, was done in R. The result shows there is a significant relationship between the text and the stock prices. However, the correlation is trivial.
 
